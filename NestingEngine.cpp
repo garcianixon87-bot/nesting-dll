@@ -16,43 +16,57 @@ struct ItemPolygon {
 
 static std::vector<ItemPolygon> g_polygons;
 static double g_margin = 0.0;
-static double g_stepAngle = 90.0;
+static double g_stepAngle = 180.0; // 180 para permitir giros invertidos en mangas
 
-// Rotar punto alrededor del origen
+// Rotar punto
 Point RotatePt(Point p, double deg) {
     double rad = deg * 3.14159265358979323846 / 180.0;
     double c = cos(rad), s = sin(rad);
     return { p.x * c - p.y * s, p.x * s + p.y * c };
 }
 
-// Algoritmo de Separating Axis Theorem (SAT) para detección exacta de superposición de polígonos
-bool PolygonsOverlap(const std::vector<Point>& polyA, const std::vector<Point>& polyB, double margin) {
-    auto checkAxis = [](const std::vector<Point>& p1, const std::vector<Point>& p2, double m) {
-        for (size_t i = 0; i < p1.size(); i++) {
-            size_t j = (i + 1) % p1.size();
-            Point axis = { -(p1[j].y - p1[i].y), p1[j].x - p1[i].x };
-            double len = sqrt(axis.x * axis.x + axis.y * axis.y);
-            if (len == 0) continue;
-            axis.x /= len; axis.y /= len;
-
-            double minA = 1e15, maxA = -1e15;
-            for (const auto& p : p1) {
-                double proj = p.x * axis.x + p.y * axis.y;
-                minA = (std::min)(minA, proj); maxA = (std::max)(maxA, proj);
-            }
-
-            double minB = 1e15, maxB = -1e15;
-            for (const auto& p : p2) {
-                double proj = p.x * axis.x + p.y * axis.y;
-                minB = (std::min)(minB, proj); maxB = (std::max)(maxB, proj);
-            }
-
-            if (maxA + m < minB || maxB + m < minA) return false;
+// Punto dentro de polígono (Ray-Casting) para detección de colisión cóncava
+bool PointInPolygon(Point p, const std::vector<Point>& poly) {
+    bool inside = false;
+    size_t n = poly.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        if (((poly[i].y > p.y) != (poly[j].y > p.y)) &&
+            (p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)) {
+            inside = !inside;
         }
-        return true;
-    };
+    }
+    return inside;
+}
 
-    return checkAxis(polyA, polyB, margin) && checkAxis(polyB, polyA, margin);
+// Verificación de intersección de segmentos de contorno
+bool SegmentsIntersect(Point p1, Point q1, Point p2, Point q2) {
+    auto CCW = [](Point A, Point B, Point C) {
+        return (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x);
+    };
+    return (CCW(p1, p2, q2) != CCW(q1, p2, q2)) && (CCW(p1, q1, p2) != CCW(p1, q1, q2));
+}
+
+// Detección de colisión True-Shape exacta entre dos piezas
+bool TrueShapeOverlap(const std::vector<Point>& polyA, const std::vector<Point>& polyB, double margin) {
+    // 1. Validar intersección de bordes
+    size_t nA = polyA.size(), nB = polyB.size();
+    for (size_t i = 0; i < nA; ++i) {
+        Point a1 = polyA[i];
+        Point a2 = polyA[(i + 1) % nA];
+        for (size_t j = 0; j < nB; ++j) {
+            Point b1 = polyB[j];
+            Point b2 = polyB[(j + 1) % nB];
+            if (SegmentsIntersect(a1, a2, b1, b2)) return true;
+        }
+    }
+    // 2. Validar inclusión de vértices (pieza contenida en hueco o dentro)
+    for (const auto& p : polyA) {
+        if (PointInPolygon(p, polyB)) return true;
+    }
+    for (const auto& p : polyB) {
+        if (PointInPolygon(p, polyA)) return true;
+    }
+    return false;
 }
 
 extern "C" {
@@ -60,7 +74,7 @@ extern "C" {
     __declspec(dllexport) int __stdcall InitEngine(double margin, double stepAngle) {
         g_polygons.clear();
         g_margin = margin;
-        g_stepAngle = (stepAngle > 0) ? stepAngle : 90.0;
+        g_stepAngle = (stepAngle > 0) ? stepAngle : 180.0;
         return 1;
     }
 
@@ -80,19 +94,20 @@ extern "C" {
     __declspec(dllexport) int __stdcall ExecuteNesting(double sheetWidth, double sheetHeight) {
         if (g_polygons.empty()) return 0;
 
-        // Ordenar piezas de mayor a menor para colocar los cuerpos grandes primero
+        // Ordenar piezas: Piezas más complejas/grandes primero
         std::sort(g_polygons.begin(), g_polygons.end(), [](const ItemPolygon& a, const ItemPolygon& b) {
             return a.rawVertices.size() > b.rawVertices.size();
         });
 
         std::vector<std::vector<Point>> placedPolygons;
 
+        // Probar rotaciones permitidas (ej: 0 y 180 para textil)
         std::vector<double> angles = { 0.0 };
         if (g_stepAngle > 0) {
             for (double a = g_stepAngle; a < 360.0; a += g_stepAngle) angles.push_back(a);
         }
 
-        double gridStep = 5.0; // Resolución de deslizamiento en mm
+        double stepXY = 8.0; // Resolución de deslizamiento en mm/unidades
 
         for (auto& poly : g_polygons) {
             bool placed = false;
@@ -102,7 +117,6 @@ extern "C" {
             std::vector<double> testAngles = poly.allowRotation ? angles : std::vector<double>{ 0.0 };
 
             for (double ang : testAngles) {
-                // 1. Obtener forma rotada
                 std::vector<Point> rotPts;
                 double minX = 1e15, maxX = -1e15, minY = 1e15, maxY = -1e15;
 
@@ -116,9 +130,9 @@ extern "C" {
                 double pW = maxX - minX;
                 double pH = maxY - minY;
 
-                // 2. Probar encastre continuo sobre la tela (Bottom-Left real)
-                for (double ty = sheetHeight - pH - g_margin; ty >= g_margin; ty -= gridStep) {
-                    for (double tx = g_margin; tx <= sheetWidth - pW - g_margin; tx += gridStep) {
+                // Escaneo Bottom-Left encastrado
+                for (double ty = g_margin; ty <= sheetHeight - pH - g_margin; ty += stepXY) {
+                    for (double tx = g_margin; tx <= sheetWidth - pW - g_margin; tx += stepXY) {
 
                         double offsetX = tx - minX;
                         double offsetY = ty - minY;
@@ -129,17 +143,18 @@ extern "C" {
                             candidate.push_back({ p.x + offsetX, p.y + offsetY });
                         }
 
-                        // Validar si choca con los POLÍGONOS REALES ya colocados
+                        // Colisión True-Shape
                         bool collide = false;
                         for (const auto& placedPoly : placedPolygons) {
-                            if (PolygonsOverlap(candidate, placedPoly, g_margin)) {
+                            if (TrueShapeOverlap(candidate, placedPoly, g_margin)) {
                                 collide = true;
                                 break;
                             }
                         }
 
                         if (!collide) {
-                            double score = (sheetHeight - ty) * 2.0 + tx; // Priorizar esquina inferior izquierda
+                            // Evaluación para compactar la tizada hacia el origen
+                            double score = ty * 10.0 + tx;
                             if (score < bestScore) {
                                 bestScore = score;
                                 bestX = offsetX;
@@ -147,7 +162,7 @@ extern "C" {
                                 bestAngle = ang;
                                 placed = true;
                             }
-                            break; // Encontró la posición más baja para esta columna
+                            break; 
                         }
                     }
                 }
@@ -158,7 +173,6 @@ extern "C" {
                 poly.resY = bestY;
                 poly.resAngle = bestAngle;
 
-                // Guardar la silueta final de la pieza para las siguientes
                 std::vector<Point> finalPts;
                 for (const auto& pt : poly.rawVertices) {
                     Point r = RotatePt(pt, bestAngle);
