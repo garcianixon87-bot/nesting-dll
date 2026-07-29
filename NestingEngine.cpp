@@ -9,62 +9,52 @@ struct Point {
 
 struct ItemPolygon {
     long id;
-    std::vector<Point> originalVertices;
+    std::vector<Point> rawVertices;
     bool allowRotation;
     double resX, resY, resAngle;
 };
 
 static std::vector<ItemPolygon> g_polygons;
 static double g_margin = 0.0;
-static double g_stepAngle = 90.0; // Grados de rotación a probar (ej. 0, 90, 180, 270)
+static double g_stepAngle = 90.0;
 
-// -----------------------------------------------------------------------------
-// FUNCIONES GEOMÉTRICAS AUXILIARES
-// -----------------------------------------------------------------------------
-
-// Rotar un punto 'p' alrededor del origen
-Point RotatePoint(Point p, double angleDegrees) {
-    double rad = angleDegrees * 3.14159265358979323846 / 180.0;
-    double c = cos(rad);
-    double s = sin(rad);
+// Rotar punto alrededor del origen
+Point RotatePt(Point p, double deg) {
+    double rad = deg * 3.14159265358979323846 / 180.0;
+    double c = cos(rad), s = sin(rad);
     return { p.x * c - p.y * s, p.x * s + p.y * c };
 }
 
-// Obtener los vértices transformados (rotados y trasladados)
-std::vector<Point> GetTransformedVertices(const ItemPolygon& poly, double tx, double ty, double angle) {
-    std::vector<Point> result;
-    result.reserve(poly.originalVertices.size());
-    for (const auto& pt : poly.originalVertices) {
-        Point r = RotatePoint(pt, angle);
-        result.push_back({ r.x + tx, r.y + ty });
-    }
-    return result;
+// Algoritmo de Separating Axis Theorem (SAT) para detección exacta de superposición de polígonos
+bool PolygonsOverlap(const std::vector<Point>& polyA, const std::vector<Point>& polyB, double margin) {
+    auto checkAxis = [](const std::vector<Point>& p1, const std::vector<Point>& p2, double m) {
+        for (size_t i = 0; i < p1.size(); i++) {
+            size_t j = (i + 1) % p1.size();
+            Point axis = { -(p1[j].y - p1[i].y), p1[j].x - p1[i].x };
+            double len = sqrt(axis.x * axis.x + axis.y * axis.y);
+            if (len == 0) continue;
+            axis.x /= len; axis.y /= len;
+
+            double minA = 1e15, maxA = -1e15;
+            for (const auto& p : p1) {
+                double proj = p.x * axis.x + p.y * axis.y;
+                minA = (std::min)(minA, proj); maxA = (std::max)(maxA, proj);
+            }
+
+            double minB = 1e15, maxB = -1e15;
+            for (const auto& p : p2) {
+                double proj = p.x * axis.x + p.y * axis.y;
+                minB = (std::min)(minB, proj); maxB = (std::max)(maxB, proj);
+            }
+
+            if (maxA + m < minB || maxB + m < minA) return false;
+        }
+        return true;
+    };
+
+    return checkAxis(polyA, polyB, margin) && checkAxis(polyB, polyA, margin);
 }
 
-// Calcular Bounding Box de una lista de puntos
-void GetBounds(const std::vector<Point>& pts, double& minX, double& maxX, double& minY, double& maxY) {
-    if (pts.empty()) return;
-    minX = maxX = pts[0].x;
-    minY = maxY = pts[0].y;
-    for (const auto& p : pts) {
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-    }
-}
-
-// Comprobar solapamiento de AABB (Axis-Aligned Bounding Box) con margen
-bool BoundingBoxesOverlap(double minA_X, double maxA_X, double minA_Y, double maxA_Y,
-                          double minB_X, double maxB_X, double minB_Y, double maxB_Y, double margin) {
-    if (maxA_X + margin < minB_X || maxB_X + margin < minA_X) return false;
-    if (maxA_Y + margin < minB_Y || maxB_Y + margin < minA_Y) return false;
-    return true;
-}
-
-// -----------------------------------------------------------------------------
-// FUNCIONES EXPUESTAS PARA LA DLL
-// -----------------------------------------------------------------------------
 extern "C" {
 
     __declspec(dllexport) int __stdcall InitEngine(double margin, double stepAngle) {
@@ -81,100 +71,100 @@ extern "C" {
         poly.resX = 0; poly.resY = 0; poly.resAngle = 0;
 
         for (long i = 0; i < count; i++) {
-            poly.originalVertices.push_back({ xPts[i], yPts[i] });
+            poly.rawVertices.push_back({ xPts[i], yPts[i] });
         }
         g_polygons.push_back(poly);
         return 1;
     }
 
-    // ALGORITMO DE TIZADA ENCASTADA (TRUE-SHAPE BOTTOM-LEFT DEEP SEARCH)
     __declspec(dllexport) int __stdcall ExecuteNesting(double sheetWidth, double sheetHeight) {
         if (g_polygons.empty()) return 0;
 
-        // Lista de piezas colocada actualmente
-        struct PlacedItem {
-            std::vector<Point> pts;
-            double minX, maxX, minY, maxY;
-        };
-        std::vector<PlacedItem> placed;
+        // Ordenar piezas de mayor a menor para colocar los cuerpos grandes primero
+        std::sort(g_polygons.begin(), g_polygons.end(), [](const ItemPolygon& a, const ItemPolygon& b) {
+            return a.rawVertices.size() > b.rawVertices.size();
+        });
 
-        // Modificadores de ángulo a probar
-        std::vector<double> testAngles = { 0.0 };
+        std::vector<std::vector<Point>> placedPolygons;
+
+        std::vector<double> angles = { 0.0 };
         if (g_stepAngle > 0) {
-            for (double a = g_stepAngle; a < 360.0; a += g_stepAngle) {
-                testAngles.push_back(a);
-            }
+            for (double a = g_stepAngle; a < 360.0; a += g_stepAngle) angles.push_back(a);
         }
 
-        // Paso de escaneo en milímetros/unidades
-        double stepSize = 10.0; // Escaneo continuo progresivo
+        double gridStep = 5.0; // Resolución de deslizamiento en mm
 
         for (auto& poly : g_polygons) {
-            bool placedSuccessfully = false;
+            bool placed = false;
             double bestX = 0, bestY = 0, bestAngle = 0;
-            double bestScore = 1e15; // Queremos minimizar la altura y posición Y/X
+            double bestScore = 1e15;
 
-            // Probar cada ángulo de rotación permitido
-            std::vector<double> anglesToTry = poly.allowRotation ? testAngles : std::vector<double>{ 0.0 };
+            std::vector<double> testAngles = poly.allowRotation ? angles : std::vector<double>{ 0.0 };
 
-            for (double ang : anglesToTry) {
-                // Generar silueta rotada temporal para medir
-                std::vector<Point> rotPts = GetTransformedVertices(poly, 0, 0, ang);
-                double pMinX, pMaxX, pMinY, pMaxY;
-                GetBounds(rotPts, pMinX, pMaxX, pMinY, pMaxY);
-                double pW = pMaxX - pMinX;
-                double pH = pMaxY - pMinY;
+            for (double ang : testAngles) {
+                // 1. Obtener forma rotada
+                std::vector<Point> rotPts;
+                double minX = 1e15, maxX = -1e15, minY = 1e15, maxY = -1e15;
 
-                // Escaneo Bottom-Left en la hoja de tela
-                for (double trialY = sheetHeight - pH - g_margin; trialY >= g_margin; trialY -= stepSize) {
-                    for (double trialX = g_margin; trialX <= sheetWidth - pW - g_margin; trialX += stepSize) {
-                        
-                        // Posición real del origen
-                        double tx = trialX - pMinX;
-                        double ty = trialY - pMinY;
+                for (const auto& pt : poly.rawVertices) {
+                    Point r = RotatePt(pt, ang);
+                    rotPts.push_back(r);
+                    minX = (std::min)(minX, r.x); maxX = (std::max)(maxX, r.x);
+                    minY = (std::min)(minY, r.y); maxY = (std::max)(maxY, r.y);
+                }
 
-                        double curMinX = trialX;
-                        double curMaxX = trialX + pW;
-                        double curMinY = trialY;
-                        double curMaxY = trialY + pH;
+                double pW = maxX - minX;
+                double pH = maxY - minY;
 
-                        // Comprobar colisión con las piezas ya ubicadas
-                        bool collision = false;
-                        for (const auto& item : placed) {
-                            if (BoundingBoxesOverlap(curMinX, curMaxX, curMinY, curMaxY,
-                                                     item.minX, item.maxX, item.minY, item.maxY, g_margin)) {
-                                collision = true;
+                // 2. Probar encastre continuo sobre la tela (Bottom-Left real)
+                for (double ty = sheetHeight - pH - g_margin; ty >= g_margin; ty -= gridStep) {
+                    for (double tx = g_margin; tx <= sheetWidth - pW - g_margin; tx += gridStep) {
+
+                        double offsetX = tx - minX;
+                        double offsetY = ty - minY;
+
+                        std::vector<Point> candidate;
+                        candidate.reserve(rotPts.size());
+                        for (const auto& p : rotPts) {
+                            candidate.push_back({ p.x + offsetX, p.y + offsetY });
+                        }
+
+                        // Validar si choca con los POLÍGONOS REALES ya colocados
+                        bool collide = false;
+                        for (const auto& placedPoly : placedPolygons) {
+                            if (PolygonsOverlap(candidate, placedPoly, g_margin)) {
+                                collide = true;
                                 break;
                             }
                         }
 
-                        if (!collision) {
-                            // Criterio de puntuación: Dar prioridad a llenar abajo y a la izquierda
-                            double score = (sheetHeight - trialY) * 10.0 + trialX;
+                        if (!collide) {
+                            double score = (sheetHeight - ty) * 2.0 + tx; // Priorizar esquina inferior izquierda
                             if (score < bestScore) {
                                 bestScore = score;
-                                bestX = tx;
-                                bestY = ty;
+                                bestX = offsetX;
+                                bestY = offsetY;
                                 bestAngle = ang;
-                                placedSuccessfully = true;
+                                placed = true;
                             }
-                            // Al encontrar la posición más baja en esta columna, pasamos a evaluar la siguiente
-                            break; 
+                            break; // Encontró la posición más baja para esta columna
                         }
                     }
                 }
             }
 
-            if (placedSuccessfully) {
+            if (placed) {
                 poly.resX = bestX;
                 poly.resY = bestY;
                 poly.resAngle = bestAngle;
 
-                // Guardar la pieza en la lista de colocadas
-                std::vector<Point> finalPts = GetTransformedVertices(poly, bestX, bestY, bestAngle);
-                double fMinX, fMaxX, fMinY, fMaxY;
-                GetBounds(finalPts, fMinX, fMaxX, fMinY, fMaxY);
-                placed.push_back({ finalPts, fMinX, fMaxX, fMinY, fMaxY });
+                // Guardar la silueta final de la pieza para las siguientes
+                std::vector<Point> finalPts;
+                for (const auto& pt : poly.rawVertices) {
+                    Point r = RotatePt(pt, bestAngle);
+                    finalPts.push_back({ r.x + bestX, r.y + bestY });
+                }
+                placedPolygons.push_back(finalPts);
             }
         }
         return 1;
