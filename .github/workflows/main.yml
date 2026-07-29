@@ -1,0 +1,19 @@
+name: Compilar DLL
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Compilar DLL
+        run: |
+          g++ -shared -o NestingEngine.dll NestingEngine.cpp
+
+      - name: Subir DLL para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: NestingEngine-DLL
+          path: NestingEngine.dll
