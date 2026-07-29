@@ -1,202 +1,132 @@
 #include <windows.h>
 #include <vector>
 #include <cmath>
-#include <algorithm>
 
+#define DLLEXPORT __declspec(dllexport)
+
+// Estructura para almacenar puntos 2D
 struct Point {
-    double x, y;
+    double x;
+    double y;
 };
 
-struct ItemPolygon {
+// Estructura para representar un molde/polígono
+struct PolygonShape {
     long id;
-    std::vector<Point> rawVertices;
-    bool allowRotation;
-    double resX, resY, resAngle;
+    long nodeCount;
+    std::vector<Point> nodes;
+    long allowRotation;
+    double resX;
+    double resY;
+    double resAngle;
 };
 
-static std::vector<ItemPolygon> g_polygons;
+// Variables globales del motor de tizada
 static double g_margin = 0.0;
-static double g_stepAngle = 180.0; // 180 para permitir giros invertidos en mangas
+static double g_stepAngle = 180.0;
+static std::vector<PolygonShape> g_polygons;
 
-// Rotar punto
-Point RotatePt(Point p, double deg) {
-    double rad = deg * 3.14159265358979323846 / 180.0;
-    double c = cos(rad), s = sin(rad);
-    return { p.x * c - p.y * s, p.x * s + p.y * c };
-}
-
-// Punto dentro de polígono (Ray-Casting) para detección de colisión cóncava
-bool PointInPolygon(Point p, const std::vector<Point>& poly) {
-    bool inside = false;
-    size_t n = poly.size();
-    for (size_t i = 0, j = n - 1; i < n; j = i++) {
-        if (((poly[i].y > p.y) != (poly[j].y > p.y)) &&
-            (p.x < (poly[j].x - poly[i].x) * (p.y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)) {
-            inside = !inside;
-        }
+// DllMain para inicialización estándar de Windows DLL
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+        break;
     }
-    return inside;
-}
-
-// Verificación de intersección de segmentos de contorno
-bool SegmentsIntersect(Point p1, Point q1, Point p2, Point q2) {
-    auto CCW = [](Point A, Point B, Point C) {
-        return (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x);
-    };
-    return (CCW(p1, p2, q2) != CCW(q1, p2, q2)) && (CCW(p1, q1, p2) != CCW(p1, q1, q2));
-}
-
-// Detección de colisión True-Shape exacta entre dos piezas
-bool TrueShapeOverlap(const std::vector<Point>& polyA, const std::vector<Point>& polyB, double margin) {
-    // 1. Validar intersección de bordes
-    size_t nA = polyA.size(), nB = polyB.size();
-    for (size_t i = 0; i < nA; ++i) {
-        Point a1 = polyA[i];
-        Point a2 = polyA[(i + 1) % nA];
-        for (size_t j = 0; j < nB; ++j) {
-            Point b1 = polyB[j];
-            Point b2 = polyB[(j + 1) % nB];
-            if (SegmentsIntersect(a1, a2, b1, b2)) return true;
-        }
-    }
-    // 2. Validar inclusión de vértices (pieza contenida en hueco o dentro)
-    for (const auto& p : polyA) {
-        if (PointInPolygon(p, polyB)) return true;
-    }
-    for (const auto& p : polyB) {
-        if (PointInPolygon(p, polyA)) return true;
-    }
-    return false;
+    return TRUE;
 }
 
 extern "C" {
 
-    __declspec(dllexport) int __stdcall InitEngine(double margin, double stepAngle) {
-        g_polygons.clear();
+    // 1. Inicializar el motor
+    DLLEXPORT long __stdcall InitEngine(double margin, double stepAngle) {
         g_margin = margin;
-        g_stepAngle = (stepAngle > 0) ? stepAngle : 180.0;
-        return 1;
+        g_stepAngle = stepAngle;
+        g_polygons.clear();
+        return 1; // OK
     }
 
-    __declspec(dllexport) int __stdcall AddPolygon(long polyID, long count, double* xPts, double* yPts, int allowRotation) {
-        ItemPolygon poly;
+    // 2. Agregar polígonos/moldes desde VBA
+    DLLEXPORT long __stdcall AddPolygon(long polyID, long nodeCount, double* xPts, double* yPts, long allowRotation) {
+        if (nodeCount < 3 || xPts == nullptr || yPts == nullptr) return 0;
+
+        PolygonShape poly;
         poly.id = polyID;
-        poly.allowRotation = (allowRotation != 0);
-        poly.resX = 0; poly.resY = 0; poly.resAngle = 0;
+        poly.nodeCount = nodeCount;
+        poly.allowRotation = allowRotation;
+        poly.resX = 0.0;
+        poly.resY = 0.0;
+        poly.resAngle = 0.0;
 
-        for (long i = 0; i < count; i++) {
-            poly.rawVertices.push_back({ xPts[i], yPts[i] });
+        for (long i = 0; i < nodeCount; ++i) {
+            poly.nodes.push_back({ xPts[i], yPts[i] });
         }
+
         g_polygons.push_back(poly);
-        return 1;
+        return 1; // OK
     }
 
-    __declspec(dllexport) int __stdcall ExecuteNesting(double sheetWidth, double sheetHeight) {
-        if (g_polygons.empty()) return 0;
-
-        // Ordenar piezas: Piezas más complejas/grandes primero
-        std::sort(g_polygons.begin(), g_polygons.end(), [](const ItemPolygon& a, const ItemPolygon& b) {
-            return a.rawVertices.size() > b.rawVertices.size();
-        });
-
-        std::vector<std::vector<Point>> placedPolygons;
-
-        // Probar rotaciones permitidas (ej: 0 y 180 para textil)
-        std::vector<double> angles = { 0.0 };
-        if (g_stepAngle > 0) {
-            for (double a = g_stepAngle; a < 360.0; a += g_stepAngle) angles.push_back(a);
-        }
-
-        double stepXY = 8.0; // Resolución de deslizamiento en mm/unidades
+    // 3. Ejecutar algoritmo de empaquetado (Nesting)
+    DLLEXPORT long __stdcall ExecuteNesting(double sheetWidth, double sheetHeight) {
+        double currentX = g_margin;
+        double currentY = g_margin;
+        double maxRowHeight = 0.0;
 
         for (auto& poly : g_polygons) {
-            bool placed = false;
-            double bestX = 0, bestY = 0, bestAngle = 0;
-            double bestScore = 1e15;
+            // Calcular Bounding Box simple de la pieza
+            double minX = poly.nodes[0].x, maxX = poly.nodes[0].x;
+            double minY = poly.nodes[0].y, maxY = poly.nodes[0].y;
 
-            std::vector<double> testAngles = poly.allowRotation ? angles : std::vector<double>{ 0.0 };
-
-            for (double ang : testAngles) {
-                std::vector<Point> rotPts;
-                double minX = 1e15, maxX = -1e15, minY = 1e15, maxY = -1e15;
-
-                for (const auto& pt : poly.rawVertices) {
-                    Point r = RotatePt(pt, ang);
-                    rotPts.push_back(r);
-                    minX = (std::min)(minX, r.x); maxX = (std::max)(maxX, r.x);
-                    minY = (std::min)(minY, r.y); maxY = (std::max)(maxY, r.y);
-                }
-
-                double pW = maxX - minX;
-                double pH = maxY - minY;
-
-                // Escaneo Bottom-Left encastrado
-                for (double ty = g_margin; ty <= sheetHeight - pH - g_margin; ty += stepXY) {
-                    for (double tx = g_margin; tx <= sheetWidth - pW - g_margin; tx += stepXY) {
-
-                        double offsetX = tx - minX;
-                        double offsetY = ty - minY;
-
-                        std::vector<Point> candidate;
-                        candidate.reserve(rotPts.size());
-                        for (const auto& p : rotPts) {
-                            candidate.push_back({ p.x + offsetX, p.y + offsetY });
-                        }
-
-                        // Colisión True-Shape
-                        bool collide = false;
-                        for (const auto& placedPoly : placedPolygons) {
-                            if (TrueShapeOverlap(candidate, placedPoly, g_margin)) {
-                                collide = true;
-                                break;
-                            }
-                        }
-
-                        if (!collide) {
-                            // Evaluación para compactar la tizada hacia el origen
-                            double score = ty * 10.0 + tx;
-                            if (score < bestScore) {
-                                bestScore = score;
-                                bestX = offsetX;
-                                bestY = offsetY;
-                                bestAngle = ang;
-                                placed = true;
-                            }
-                            break; 
-                        }
-                    }
-                }
+            for (const auto& pt : poly.nodes) {
+                if (pt.x < minX) minX = pt.x;
+                if (pt.x > maxX) maxX = pt.x;
+                if (pt.y < minY) minY = pt.y;
+                if (pt.y > maxY) maxY = pt.y;
             }
 
-            if (placed) {
-                poly.resX = bestX;
-                poly.resY = bestY;
-                poly.resAngle = bestAngle;
+            double width = maxX - minX;
+            double height = maxY - minY;
 
-                std::vector<Point> finalPts;
-                for (const auto& pt : poly.rawVertices) {
-                    Point r = RotatePt(pt, bestAngle);
-                    finalPts.push_back({ r.x + bestX, r.y + bestY });
-                }
-                placedPolygons.push_back(finalPts);
+            // Salto de fila si excede el ancho de la mesa/lámina
+            if (currentX + width + g_margin > sheetWidth) {
+                currentX = g_margin;
+                currentY += maxRowHeight + g_margin;
+                maxRowHeight = 0.0;
+            }
+
+            // Asignar nuevas coordenadas relativas
+            poly.resX = currentX - minX;
+            poly.resY = currentY - minY;
+            poly.resAngle = 0.0; // Ángulo por defecto si no requiere rotación
+
+            // Actualizar límites
+            currentX += width + g_margin;
+            if (height > maxRowHeight) {
+                maxRowHeight = height;
             }
         }
-        return 1;
+        return 1; // OK
     }
 
-    __declspec(dllexport) int __stdcall GetResult(long polyID, double* outX, double* outY, double* outAngle) {
+    // 4. Devolver resultado a VBA
+    DLLEXPORT long __stdcall GetResult(long polyID, double* outX, double* outY, double* outAngle) {
         for (const auto& poly : g_polygons) {
             if (poly.id == polyID) {
-                *outX = poly.resX;
-                *outY = poly.resY;
-                *outAngle = poly.resAngle;
-                return 1;
+                if (outX) *outX = poly.resX;
+                if (outY) *outY = poly.resY;
+                if (outAngle) *outAngle = poly.resAngle;
+                return 1; // Encontrado
             }
         }
-        return 0;
+        return 0; // No encontrado
     }
 
-    __declspec(dllexport) void __stdcall FreeEngine() {
+    // 5. Limpiar memoria al finalizar
+    DLLEXPORT void __stdcall FreeEngine() {
         g_polygons.clear();
+        g_polygons.shrink_to_fit();
     }
+
 }
